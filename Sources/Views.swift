@@ -36,7 +36,6 @@ struct MenuContent: View {
     @EnvironmentObject var model: AppModel
     @ObservedObject var live = LiveWallpaper.shared
     @Environment(\.openWindow) private var openWindow
-    @State private var openAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
         Button("Open Wallpaper Porter") {
@@ -51,11 +50,11 @@ struct MenuContent: View {
         }
         Divider()
         Toggle("Open at Login", isOn: Binding(
-            get: { openAtLogin },
+            get: { SMAppService.mainApp.status == .enabled },
             set: { on in
                 do { if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } }
                 catch { model.alert = "Couldn't change login item: \(error.localizedDescription). Try moving the app to Applications first." }
-                openAtLogin = SMAppService.mainApp.status == .enabled
+                model.objectWillChange.send()
             }))
         Divider()
         Button("Quit Wallpaper Porter") { NSApp.terminate(nil) }.keyboardShortcut("q")
@@ -68,9 +67,7 @@ struct MenuContent: View {
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
     @ObservedObject var live = LiveWallpaper.shared
-    @State private var links = ""
-    @State private var showSetup = false
-    @State private var picking: LibraryItem?
+    @StateObject private var ui = ContentState()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -78,7 +75,7 @@ struct ContentView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    if !model.steamReady || showSetup { SetupCard(collapse: { showSetup = false }) }
+                    if !model.steamReady || ui.showSetup { SetupCard(collapse: { ui.showSetup = false }) }
                     importBar
                     if !model.jobs.isEmpty { JobsList() }
                     librarySection
@@ -86,7 +83,7 @@ struct ContentView: View {
                 .padding(20)
             }
         }
-        .sheet(item: $picking) { item in ImagePicker(item: item) }
+        .sheet(item: $ui.picking) { (item: LibraryItem) in ImagePicker(item: item) }
         .alert("Wallpaper Porter", isPresented: Binding(get: { model.alert != nil }, set: { if !$0 { model.alert = nil } })) {
             Button("OK") { model.alert = nil }
         } message: { Text(model.alert ?? "") }
@@ -107,7 +104,7 @@ struct ContentView: View {
                 Button("Stop") { live.stop() }
             }
             if model.steamReady {
-                Button { showSetup.toggle() } label: { Image(systemName: "gearshape") }
+                Button { ui.showSetup.toggle() } label: { Image(systemName: "gearshape") }
                     .help("Steam setup")
             }
         }
@@ -118,14 +115,14 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Add wallpapers").font(.headline)
             HStack(alignment: .top, spacing: 10) {
-                TextField("Paste Steam Workshop links (one or more)…", text: $links, axis: .vertical)
+                TextField("Paste Steam Workshop links (one or more)…", text: $ui.links, axis: .vertical)
                     .lineLimit(1 ... 5)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(submit)
                 Button("Import", action: submit)
                     .keyboardShortcut(.return, modifiers: .command)
                     .buttonStyle(.borderedProminent)
-                    .disabled(links.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(ui.links.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 Button("Import Folder…", action: pickFolder)
                     .help("Already have a downloaded Workshop folder (with project.json)? Import it directly.")
             }
@@ -152,7 +149,7 @@ struct ContentView: View {
             } else {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 230), spacing: 16)], spacing: 16) {
                     ForEach(model.library) { item in
-                        WallpaperCard(item: item, isLive: live.currentItemID == item.id, pick: { picking = item })
+                        WallpaperCard(item: item, isLive: live.currentItemID == item.id, pick: { ui.picking = item })
                     }
                 }
             }
@@ -160,9 +157,9 @@ struct ContentView: View {
     }
 
     private func submit() {
-        let n = model.importLinks(links)
+        let n = model.importLinks(ui.links)
         if n == 0 { model.alert = "No Steam Workshop links found. Paste a link like steamcommunity.com/sharedfiles/filedetails/?id=…" }
-        else { links = "" }
+        else { ui.links = "" }
     }
 
     private func pickFolder() {
@@ -281,7 +278,6 @@ struct WallpaperCard: View {
     let item: LibraryItem
     let isLive: Bool
     let pick: () -> Void
-    @State private var showNotes = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -305,7 +301,7 @@ struct WallpaperCard: View {
                 Menu {
                     if item.stills.count > 1 { Button("Choose Image…", action: pick) }
                     Button("Show in Finder") { model.reveal(item) }
-                    if let notes = item.notes, !notes.isEmpty { Button("Conversion Notes…") { showNotes = true } }
+                    if let notes = item.notes, !notes.isEmpty { Button("Conversion Notes…") { model.alert = notes.map { "• " + $0 }.joined(separator: "\n\n") } }
                     Divider()
                     Button("Move to Trash", role: .destructive) { model.delete(item) }
                 } label: { Image(systemName: "ellipsis.circle") }
@@ -316,12 +312,6 @@ struct WallpaperCard: View {
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.cardFill))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(isLive ? Color.green.opacity(0.6) : .clear, lineWidth: 2))
-        .popover(isPresented: $showNotes) {
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(item.notes ?? [], id: \.self) { Text("• " + $0).fixedSize(horizontal: false, vertical: true) }
-            }
-            .padding().frame(width: 320)
-        }
     }
 }
 
@@ -338,22 +328,19 @@ struct Badge: View {
 @MainActor
 struct Thumbnail: View {
     let url: URL?
-    @State private var image: NSImage?
+    @StateObject private var loader = ThumbLoader()
 
     var body: some View {
         ZStack {
             Rectangle().fill(.quaternary)
-            if let image {
+            if let image = loader.image {
                 Image(nsImage: image).resizable().scaledToFill()
             } else {
                 Image(systemName: "photo").font(.title).foregroundStyle(.tertiary)
             }
         }
         .clipped()
-        .task(id: url) {
-            guard let url else { image = nil; return }
-            image = await Task.detached { NSImage(contentsOf: url) }.value
-        }
+        .task(id: url) { await loader.load(url) }
     }
 }
 
@@ -398,4 +385,21 @@ struct ImagePicker: View {
 
 extension Color {
     static let cardFill = Color(nsColor: .controlBackgroundColor)
+}
+
+@MainActor
+final class ContentState: ObservableObject {
+    @Published var links = ""
+    @Published var showSetup = false
+    @Published var picking: LibraryItem?
+}
+
+@MainActor
+final class ThumbLoader: ObservableObject {
+    @Published var image: NSImage?
+    func load(_ url: URL?) async {
+        guard let url else { image = nil; return }
+        let data = await Task.detached { try? Data(contentsOf: url) }.value
+        image = data.flatMap { NSImage(data: $0) }
+    }
 }

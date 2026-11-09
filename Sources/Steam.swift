@@ -183,31 +183,10 @@ enum Shell {
             p.standardOutput = pipe
             p.standardError = pipe
 
-            let lock = NSLock()
-            var buffer = Data()
-            func flush(_ final: Bool) {
-                while let nl = buffer.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
-                    let lineData = buffer[buffer.startIndex ..< nl]
-                    buffer.removeSubrange(buffer.startIndex ... nl)
-                    let line = String(decoding: lineData, as: UTF8.self)
-                    if !line.trimmingCharacters(in: .whitespaces).isEmpty { onLine?(line, p) }
-                }
-                if final, !buffer.isEmpty {
-                    onLine?(String(decoding: buffer, as: UTF8.self), p)
-                    buffer.removeAll()
-                }
-            }
+            let lines = LineBuffer { line in onLine?(line, p) }
             pipe.fileHandleForReading.readabilityHandler = { h in
                 let d = h.availableData
-                lock.lock(); defer { lock.unlock() }
-                if d.isEmpty { return }
-                buffer.append(d)
-                // SteamCMD prints prompts without a newline; surface them too.
-                if let s = String(data: buffer, encoding: .utf8), s.lowercased().hasSuffix("password: ") || s.hasSuffix(":") {
-                    flush(true)
-                } else {
-                    flush(false)
-                }
+                if !d.isEmpty { lines.append(d) }
             }
 
             let timer = DispatchWorkItem { if p.isRunning { p.terminate() } }
@@ -215,7 +194,8 @@ enum Shell {
                 timer.cancel()
                 pipe.fileHandleForReading.readabilityHandler = nil
                 let rest = pipe.fileHandleForReading.readDataToEndOfFile()
-                lock.lock(); buffer.append(rest); flush(true); lock.unlock()
+                lines.append(rest)
+                lines.finish()
                 cont.resume(returning: proc.terminationStatus)
             }
             do {
@@ -224,6 +204,41 @@ enum Shell {
             } catch {
                 cont.resume(throwing: error)
             }
+        }
+    }
+}
+
+/// Thread-safe line splitter for process output.
+final class LineBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer = Data()
+    private let onLine: (String) -> Void
+
+    init(_ onLine: @escaping (String) -> Void) { self.onLine = onLine }
+
+    func append(_ d: Data) {
+        lock.lock(); defer { lock.unlock() }
+        buffer.append(d)
+        // SteamCMD prints prompts like "password:" without a newline; surface them too.
+        let tail = String(decoding: buffer.suffix(32), as: UTF8.self).lowercased()
+        flush(final: tail.hasSuffix("password: ") || tail.hasSuffix("code: ") || tail.hasSuffix(":"))
+    }
+
+    func finish() {
+        lock.lock(); defer { lock.unlock() }
+        flush(final: true)
+    }
+
+    private func flush(final: Bool) {
+        while let nl = buffer.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
+            let line = String(decoding: buffer[buffer.startIndex ..< nl], as: UTF8.self)
+            buffer.removeSubrange(buffer.startIndex ... nl)
+            if !line.trimmingCharacters(in: .whitespaces).isEmpty { onLine(line) }
+        }
+        if final, !buffer.isEmpty {
+            let line = String(decoding: buffer, as: UTF8.self)
+            buffer.removeAll()
+            if !line.trimmingCharacters(in: .whitespaces).isEmpty { onLine(line) }
         }
     }
 }
